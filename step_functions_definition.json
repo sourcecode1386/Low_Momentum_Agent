@@ -1,0 +1,135 @@
+{
+  "Comment": "Low Momentum Account Intelligence Agent — orchestrates batch processing of low-momentum clients through AgentCore research, then merges results into CSV deliverables. Mirrors the upsell-research-pipeline pattern.",
+
+  "StartAt": "ListBatchFiles",
+
+  "States": {
+
+    "ListBatchFiles": {
+      "Type": "Task",
+      "Comment": "Lambda lists all batch JSON files written by 01_preprocess_low_momentum.py for the given run_date. Returns an array of batch_s3_key strings for the Map state to fan out over.",
+      "Resource": "${ListBatchesLambdaArn}",
+      "Parameters": {
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.batch_list",
+      "Next": "ProcessBatches",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "PipelineFailed",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "ProcessBatches": {
+      "Type": "Map",
+      "Comment": "Fan out across all batch files. Each iteration invokes Lambda A (prep) → Lambda B (worker) → AgentCore for one batch of 3 clients. MaxConcurrency=5 keeps AgentCore load manageable and avoids Step Functions history limit issues at 300+ client scale.",
+      "ItemsPath": "$.batch_list.batch_keys",
+      "ItemSelector": {
+        "batch_s3_key.$": "$$.Map.Item.Value",
+        "run_date.$": "$$.Execution.Input.run_date"
+      },
+      "MaxConcurrency": 5,
+      "Iterator": {
+        "StartAt": "RunBatch",
+        "States": {
+          "RunBatch": {
+            "Type": "Task",
+            "Comment": "Lambda A: checks idempotency, invokes Lambda B which calls AgentCore for the batch.",
+            "Resource": "${PrepLambdaArn}",
+            "Parameters": {
+              "batch_s3_key.$": "$.batch_s3_key",
+              "run_date.$": "$.run_date"
+            },
+            "TimeoutSeconds": 960,
+            "Retry": [
+              {
+                "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 2,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "Next": "BatchFailed",
+                "ResultPath": "$.batch_error"
+              }
+            ],
+            "End": true
+          },
+          "BatchFailed": {
+            "Type": "Pass",
+            "Comment": "Catch individual batch failures gracefully — a single bad batch does not fail the whole pipeline. The postprocessor handles missing results.",
+            "Parameters": {
+              "status": "batch_error",
+              "batch_s3_key.$": "$.batch_s3_key",
+              "error.$": "$.batch_error"
+            },
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.batch_results",
+      "Next": "RunPostProcessing",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "PipelineFailed",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "RunPostProcessing": {
+      "Type": "Task",
+      "Comment": "Lambda reads all individual client result JSONs from S3, merges them into two CSV deliverables (summary + detail) and a portfolio risk rollup JSON. Mirrors the upsell postprocessor pattern.",
+      "Resource": "${PostProcessLambdaArn}",
+      "Parameters": {
+        "run_date.$": "$.run_date",
+        "batch_results.$": "$.batch_results"
+      },
+      "TimeoutSeconds": 300,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException"],
+          "IntervalSeconds": 10,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "PipelineSucceeded",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "Next": "PipelineFailed",
+          "ResultPath": "$.error"
+        }
+      ]
+    },
+
+    "PipelineSucceeded": {
+      "Type": "Succeed",
+      "Comment": "All batches processed and deliverables written. Check S3 for results."
+    },
+
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Comment": "Pipeline encountered an unrecoverable error. Check CloudWatch logs for the failing Lambda.",
+      "Error": "LowMomentumPipelineError",
+      "Cause": "One or more pipeline states failed. See error details in execution history."
+    }
+
+  }
+}
